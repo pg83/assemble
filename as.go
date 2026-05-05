@@ -6,8 +6,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
-	"os/exec"
-	"strings"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -104,12 +103,17 @@ type Node struct {
 	OutDirs []string `json:"out_dir"`
 	Cmds    []Cmd    `json:"cmd"`
 	Pool    string   `json:"pool"`
+	Isolate bool     `json:"isolate"`
+	Tmpfs   bool     `json:"tmpfs"`
+	Tmp     string   `json:"tmp"`
 }
 
 type Graph struct {
-	Nodes   []Node         `json:"nodes"`
-	Targets []string       `json:"targets"`
-	Pools   map[string]int `json:"pools"`
+	Nodes    []Node         `json:"nodes"`
+	Targets  []string       `json:"targets"`
+	Pools    map[string]int `json:"pools"`
+	IxRoot   string         `json:"ix_root"`
+	TrashDir string         `json:"trash_dir"`
 }
 
 func newGraph(r io.Reader) *Graph {
@@ -150,34 +154,17 @@ func checkExists(path string) bool {
 	return err == nil
 }
 
-func env(cmd *Cmd, thrs int) []string {
-	ret := []string{}
+func envMap(cmd *Cmd, thrs int) map[string]string {
+	ret := make(map[string]string, len(cmd.Env)+2)
 
 	for k, v := range cmd.Env {
-		ret = append(ret, k+"="+v)
+		ret[k] = v
 	}
 
-	ret = append(ret, fmt.Sprintf("make_thrs=%d", thrs))
-	ret = append(ret, fmt.Sprintf("IX_RANDOM=%d", rand.Int63()))
+	ret["make_thrs"] = fmt.Sprintf("%d", thrs)
+	ret["IX_RANDOM"] = fmt.Sprintf("%d", rand.Int63())
 
 	return ret
-}
-
-func lookupPath(prog string, path string) string {
-	if prog[:1] == "/" {
-		return prog
-	}
-
-	for _, p := range strings.Split(path, ":") {
-		pp := p + "/" + prog
-
-		if checkExists(pp) {
-			return pp
-		}
-	}
-
-	fmtException("can not find %s in %s", prog, path).throw()
-	panic(nil)
 }
 
 func complete(node *Node, out io.Writer) bool {
@@ -192,41 +179,30 @@ func complete(node *Node, out io.Writer) bool {
 	return true
 }
 
-func newStdin(s string) io.Reader {
-	if len(s) > 0 {
-		return strings.NewReader(s)
+func moveToTrash(trashDir, d string) {
+	target := filepath.Join(trashDir, fmt.Sprintf("%d", rand.Int63()))
+
+	err := os.Rename(d, target)
+
+	if err == nil {
+		return
 	}
 
-	return nil
+	if os.IsNotExist(err) {
+		return
+	}
+
+	if rmErr := os.RemoveAll(d); rmErr != nil && !os.IsNotExist(rmErr) {
+		fmtException("rm %s: %w", d, rmErr).throw()
+	}
 }
 
-func executeCmd(c *Cmd, net bool, thrs int, out io.Writer) error {
-	args := []string{}
+func prepareDir(trashDir, d string) {
+	moveToTrash(trashDir, d)
 
-	if !net {
-		// unshare network namespace
-		args = append(args, "/bin/unshare", "-r", "-n")
+	if err := os.MkdirAll(d, 0755); err != nil {
+		fmtException("mkdir %s: %w", d, err).throw()
 	}
-
-	// resolve full path to real binary
-	args = append(args, lookupPath(c.Args[0], c.Env["PATH"]))
-
-	// and add rest
-	args = append(args, c.Args[1:]...)
-
-	cmd := &exec.Cmd{
-		Path:   args[0],
-		Args:   args,
-		Env:    env(c, thrs),
-		Dir:    "/",
-		Stdin:  newStdin(c.Stdin),
-		Stdout: out,
-		Stderr: out,
-	}
-
-	// fmt.Println(cmd.String())
-
-	return cmd.Run()
 }
 
 func cat[T any](a []T, b []T) []T {
@@ -234,6 +210,14 @@ func cat[T any](a []T, b []T) []T {
 }
 
 func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
+	for _, d := range node.OutDirs {
+		prepareDir(self.trashDir, d)
+	}
+
+	if node.Tmp != "" {
+		prepareDir(self.trashDir, node.Tmp)
+	}
+
 	net := node.Pool == "network"
 	nouts := outs(node)
 
@@ -248,9 +232,17 @@ func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 	for i := range node.Cmds {
 		cmd := &node.Cmds[i]
 
-		if err := executeCmd(cmd, net, thrs, out); err != nil {
+		if err := runWrapped(cmd, node, envMap(cmd, thrs), out); err != nil {
+			for _, d := range node.OutDirs {
+				moveToTrash(self.trashDir, d)
+			}
+
 			fmtException("%v failed with %w", cat(nouts, cmd.Args), err).throw()
 		}
+	}
+
+	if node.Tmp != "" {
+		moveToTrash(self.trashDir, node.Tmp)
 	}
 
 	syscall.Sync()
@@ -276,11 +268,12 @@ func (self *future) callOnce() {
 }
 
 type executor struct {
-	thr  int
-	out  map[string]*future
-	sem  map[string]*semaphore
-	wait atomic.Uint64
-	done atomic.Uint64
+	thr      int
+	trashDir string
+	out      map[string]*future
+	sem      map[string]*semaphore
+	wait     atomic.Uint64
+	done     atomic.Uint64
 }
 
 func (self *executor) complete() string {
@@ -311,8 +304,13 @@ func newNodeFuture(ex *executor, node *Node) *future {
 
 func newExecutor(graph *Graph) *executor {
 	res := &executor{
-		out: map[string]*future{},
-		sem: map[string]*semaphore{},
+		out:      map[string]*future{},
+		sem:      map[string]*semaphore{},
+		trashDir: graph.TrashDir,
+	}
+
+	if err := os.MkdirAll(res.trashDir, 0755); err != nil {
+		fmtException("mkdir trash %s: %w", res.trashDir, err).throw()
 	}
 
 	// construct backrefs
@@ -376,6 +374,16 @@ func (self *executor) visitAll(nodes []string) {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "exec" {
+		try(func() {
+			cliExec()
+		}).catch(func(exc *Exception) {
+			exc.fatal(2, "assemble exec")
+		})
+
+		return
+	}
+
 	try(func() {
 		newGraph(os.Stdin).execute()
 	}).catch(func(exc *Exception) {
