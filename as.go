@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -55,14 +57,20 @@ type Cmd struct {
 	Env   map[string]string `json:"env"`
 }
 
+type Predict struct {
+	Path string `json:"path"`
+	Sum  string `json:"sum"`
+}
+
 type Node struct {
-	InDirs  []string `json:"in_dir"`
-	OutDirs []string `json:"out_dir"`
-	Cmds    []Cmd    `json:"cmd"`
-	Pool    string   `json:"pool"`
-	Isolate bool     `json:"isolate"`
-	Tmpfs   bool     `json:"tmpfs"`
-	Tmp     string   `json:"tmp"`
+	InDirs  []string  `json:"in_dir"`
+	OutDirs []string  `json:"out_dir"`
+	Cmds    []Cmd     `json:"cmd"`
+	Pool    string    `json:"pool"`
+	Isolate bool      `json:"isolate"`
+	Tmpfs   bool      `json:"tmpfs"`
+	Tmp     string    `json:"tmp"`
+	Predict []Predict `json:"predict,omitempty"`
 }
 
 type Graph struct {
@@ -163,6 +171,31 @@ func cat[T any](a []T, b []T) []T {
 	return append(append([]T{}, a...), b...)
 }
 
+func sha256File(path string) string {
+	f := Throw2(os.Open(path))
+	defer f.Close()
+
+	h := sha256.New()
+	Throw2(io.Copy(h, f))
+
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+func verifyPredict(node *Node, out io.Writer) {
+	for _, p := range node.Predict {
+		actual := sha256File(p.Path)
+
+		if len(p.Sum) < 16 {
+			fmt.Fprintln(out, color(Y, fmt.Sprintf("PREDICT %s actual sha256=%s (sum=%q is short, bootstrap)", p.Path, actual, p.Sum)))
+			ThrowFmt("predict bootstrap: %s sum=%q < 16 chars; actual=%s", p.Path, p.Sum, actual)
+		}
+
+		if actual != p.Sum {
+			ThrowFmt("predict mismatch: %s expected=%s actual=%s", p.Path, p.Sum, actual)
+		}
+	}
+}
+
 func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 	for _, d := range node.OutDirs {
 		prepareDir(self.trashDir, d)
@@ -194,6 +227,8 @@ func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 
 		ThrowFmt("%v failed with %w", cat(nouts, cmd.Args), err)
 	}
+
+	verifyPredict(node, out)
 
 	if node.Tmp != "" {
 		moveToTrash(self.trashDir, node.Tmp)
