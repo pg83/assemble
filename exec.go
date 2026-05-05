@@ -3,13 +3,12 @@ package main
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
+	"syscall"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,12 +39,6 @@ func mkdirAll(p string) {
 func mkdir(p string) {
 	if err := os.Mkdir(p, 0755); err != nil {
 		fmtException("mkdir %s: %w", p, err).throw()
-	}
-}
-
-func writeFile(p string, data []byte) {
-	if err := os.WriteFile(p, data, 0); err != nil {
-		fmtException("write %s: %w", p, err).throw()
 	}
 }
 
@@ -82,31 +75,10 @@ func setupShadow(inDirs []string, outDir, buildRoot, ixRoot string) {
 	mountSyscall(shadowStore, realStore, "", unix.MS_BIND|unix.MS_REC, "")
 }
 
-func setupSandbox(n *Node) {
+func setupMounts(n *Node) {
 	if !n.Isolate && !n.Tmpfs {
 		return
 	}
-
-	runtime.LockOSThread()
-
-	uid := os.Getuid()
-	gid := os.Getgid()
-
-	flags := unix.CLONE_NEWUSER | unix.CLONE_NEWNS
-
-	if n.Pool != "network" {
-		flags |= unix.CLONE_NEWNET
-	}
-
-	if err := unix.Unshare(flags); err != nil {
-		fmtException("unshare: %w", err).throw()
-	}
-
-	writeFile("/proc/self/setgroups", []byte("deny\n"))
-	writeFile("/proc/self/uid_map", []byte(fmt.Sprintf("0 %d 1\n", uid)))
-	writeFile("/proc/self/gid_map", []byte(fmt.Sprintf("0 %d 1\n", gid)))
-
-	mountSyscall("", "/", "", unix.MS_REC|unix.MS_PRIVATE, "")
 
 	if n.Tmp == "" {
 		return
@@ -157,6 +129,44 @@ func envToList(env map[string]string) []string {
 	return res
 }
 
+func selfPath() string {
+	p, err := os.Executable()
+
+	if err != nil {
+		fmtException("os.Executable: %w", err).throw()
+	}
+
+	return p
+}
+
+func dupFromMemfd(name string, payload []byte) {
+	fd, err := unix.MemfdCreate(name, 0)
+
+	if err != nil {
+		fmtException("memfd_create: %w", err).throw()
+	}
+
+	for len(payload) > 0 {
+		n, err := unix.Write(fd, payload)
+
+		if err != nil {
+			fmtException("write memfd: %w", err).throw()
+		}
+
+		payload = payload[n:]
+	}
+
+	if _, err := unix.Seek(fd, 0, 0); err != nil {
+		fmtException("seek memfd: %w", err).throw()
+	}
+
+	if err := unix.Dup2(fd, 0); err != nil {
+		fmtException("dup2 memfd: %w", err).throw()
+	}
+
+	unix.Close(fd)
+}
+
 func cliExec() {
 	var cfg ExecCfg
 
@@ -168,62 +178,56 @@ func cliExec() {
 		fmtException("empty args").throw()
 	}
 
-	setupSandbox(&cfg.Node)
+	setupMounts(&cfg.Node)
 
 	prog := lookupPathExec(cfg.Cmd.Args[0], cfg.Env["PATH"])
 
-	cmd := &exec.Cmd{
-		Path:   prog,
-		Args:   cfg.Cmd.Args,
-		Env:    envToList(cfg.Env),
-		Stdin:  strings.NewReader(cfg.Cmd.Stdin),
-		Stdout: os.Stdout,
-		Stderr: os.Stderr,
+	dupFromMemfd("cmd-stdin", []byte(cfg.Cmd.Stdin))
+
+	if err := syscall.Exec(prog, cfg.Cmd.Args, envToList(cfg.Env)); err != nil {
+		fmtException("exec %s: %w", prog, err).throw()
 	}
-
-	err := cmd.Run()
-
-	if err == nil {
-		return
-	}
-
-	if ee, ok := err.(*exec.ExitError); ok {
-		os.Exit(ee.ExitCode())
-	}
-
-	fmtException("run %s: %w", prog, err).throw()
-}
-
-func wrapCmdJSON(c *Cmd, n *Node, env map[string]string) ([]byte, error) {
-	cfg := ExecCfg{
-		Node: *n,
-		Cmd:  *c,
-		Env:  env,
-	}
-
-	return json.Marshal(cfg)
-}
-
-func selfPath() string {
-	p, err := os.Executable()
-
-	if err != nil {
-		fmtException("os.Executable: %w", err).throw()
-	}
-
-	return p
 }
 
 func runWrapped(c *Cmd, n *Node, env map[string]string, out io.Writer) error {
-	payload, err := wrapCmdJSON(c, n, env)
+	if !n.Isolate && !n.Tmpfs {
+		prog := lookupPathExec(c.Args[0], env["PATH"])
 
-	if err != nil {
-		return err
+		cmd := &exec.Cmd{
+			Path:   prog,
+			Args:   c.Args,
+			Env:    envToList(env),
+			Stdin:  strings.NewReader(c.Stdin),
+			Stdout: out,
+			Stderr: out,
+		}
+
+		return cmd.Run()
 	}
 
+	payload, err := json.Marshal(ExecCfg{Node: *n, Cmd: *c, Env: env})
+
+	if err != nil {
+		fmtException("marshal cfg: %w", err).throw()
+	}
+
+	unsharePath, err := exec.LookPath("unshare")
+
+	if err != nil {
+		fmtException("find unshare: %w", err).throw()
+	}
+
+	args := []string{"unshare", "-U", "-m", "-r"}
+
+	if n.Pool != "network" {
+		args = append(args, "-n")
+	}
+
+	args = append(args, selfPath(), "exec")
+
 	cmd := &exec.Cmd{
-		Path:   selfPath(),
-		Args:   []string{selfPath(), "exec"},
+		Path:   unsharePath,
+		Args:   args,
 		Stdin:  bytes.NewReader(payload),
 		Stdout: out,
 		Stderr: out,
