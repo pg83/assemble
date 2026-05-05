@@ -181,14 +181,9 @@ func sha256File(path string) string {
 	return hex.EncodeToString(h.Sum(nil))
 }
 
-func verifyPredict(node *Node, out io.Writer) {
+func verifyPredict(node *Node) {
 	for _, p := range node.Predict {
 		actual := sha256File(p.Path)
-
-		if len(p.Sum) < 16 {
-			fmt.Fprintln(out, color(Y, fmt.Sprintf("PREDICT %s actual sha256=%s (sum=%q is short, bootstrap)", p.Path, actual, p.Sum)))
-			ThrowFmt("predict bootstrap: %s sum=%q < 16 chars; actual=%s", p.Path, p.Sum, actual)
-		}
 
 		if actual != p.Sum {
 			ThrowFmt("predict mismatch: %s expected=%s actual=%s", p.Path, p.Sum, actual)
@@ -228,7 +223,7 @@ func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 		ThrowFmt("%v failed with %w", cat(nouts, cmd.Args), err)
 	}
 
-	verifyPredict(node, out)
+	verifyPredict(node)
 
 	if node.Tmp != "" {
 		moveToTrash(self.trashDir, node.Tmp)
