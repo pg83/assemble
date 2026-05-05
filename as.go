@@ -168,10 +168,6 @@ func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 		prepareDir(self.trashDir, d)
 	}
 
-	if node.Tmp != "" {
-		prepareDir(self.trashDir, node.Tmp)
-	}
-
 	net := node.Pool == "network"
 	nouts := outs(node)
 

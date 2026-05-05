@@ -101,16 +101,26 @@ func copyTree(src, dst string) {
 func setupRoot(cfg *ExecCfg) {
 	n := &cfg.Node
 
-	if !n.Isolate && !n.Tmpfs {
+	if n.Tmp == "" {
 		return
 	}
 
-	if n.Tmp == "" {
+	if !n.Isolate && !n.Tmpfs {
+		mkdirAll(n.Tmp)
 		return
 	}
 
 	buildRoot := filepath.Dir(n.Tmp)
 	ixRoot := filepath.Dir(buildRoot)
+
+	if n.Tmpfs {
+		setupTmpfs(buildRoot)
+		mkdirAll(n.Tmp)
+	}
+
+	if !n.Isolate {
+		return
+	}
 
 	prepRoot := filepath.Join(n.Tmp, "root")
 	mkdirAll(prepRoot)
@@ -174,13 +184,7 @@ func setupRoot(cfg *ExecCfg) {
 
 	buildInside := inside(filepath.Join(ixRoot, "build"))
 	mkdirAll(buildInside)
-
-	if n.Tmpfs {
-		setupTmpfs(buildInside)
-		mkdirAll(filepath.Join(buildInside, filepath.Base(n.Tmp)))
-	} else {
-		mountSyscall(buildRoot, buildInside, "", unix.MS_BIND|unix.MS_REC, "")
-	}
+	mkdirAll(filepath.Join(buildInside, filepath.Base(n.Tmp)))
 
 	putOld := filepath.Join(prepRoot, "old_root")
 	mkdirAll(putOld)
@@ -254,34 +258,28 @@ func cliExec() {
 }
 
 func runWrapped(c *Cmd, n *Node, env map[string]string, out io.Writer) error {
-	if !n.Isolate && !n.Tmpfs {
-		prog := lookupPathExec(c.Args[0], env["PATH"])
-
-		cmd := &exec.Cmd{
-			Path:   prog,
-			Args:   c.Args,
-			Env:    envToList(env),
-			Stdin:  strings.NewReader(c.Stdin),
-			Stdout: out,
-			Stderr: out,
-		}
-
-		return cmd.Run()
-	}
-
 	payload := Throw2(json.Marshal(ExecCfg{Node: *n, Cmd: *c, Env: env}))
-	unsharePath := Throw2(exec.LookPath("unshare"))
 
-	args := []string{"unshare", "-U", "-m", "-r"}
+	var args []string
+	var unsh []string
 
 	if n.Pool != "network" {
-		args = append(args, "-n")
+		unsh = append(unsh, "-n")
 	}
 
-	args = append(args, selfPath(), "exec")
+	if n.Isolate || n.Tmpfs {
+		unsh = append(unsh, "-m")
+	}
+
+    if len(unsh) > 0 {
+        args = append(args, "unshare", "-U", "-r")
+        args = append(args, unsh...)
+    }
+
+    args = append(args, selfPath(), "exec")
 
 	cmd := &exec.Cmd{
-		Path:   unsharePath,
+		Path:   Throw2(exec.LookPath(args[0])),
 		Args:   args,
 		Stdin:  bytes.NewReader(payload),
 		Stdout: out,
