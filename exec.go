@@ -227,16 +227,16 @@ func selfPath() string {
 }
 
 func dupStdinFromBytes(payload []byte) {
-	r, w := Throw3(os.Pipe())
+	fd := Throw2(unix.MemfdCreate("cmd-stdin", 0))
 
-	if len(payload) > 0 {
-		Throw2(unix.FcntlInt(w.Fd(), unix.F_SETPIPE_SZ, len(payload)))
-		Throw2(w.Write(payload))
+	for len(payload) > 0 {
+		n := Throw2(unix.Write(fd, payload))
+		payload = payload[n:]
 	}
 
-	Throw(w.Close())
-	Throw(unix.Dup2(int(r.Fd()), 0))
-	Throw(r.Close())
+	Throw2(unix.Seek(fd, 0, 0))
+	Throw(unix.Dup2(fd, 0))
+	Throw(unix.Close(fd))
 }
 
 func cliExec() {
