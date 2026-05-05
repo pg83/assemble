@@ -12,52 +12,9 @@ import (
 	"syscall"
 )
 
-type Exception struct {
-	what func() error
-}
-
-func (self *Exception) throw() {
-	panic(self)
-}
-
-func (self *Exception) catch(cb func(*Exception)) {
-	if self != nil {
-		cb(self)
-	}
-}
-
-func (self *Exception) fatal(code int, prefix string) {
-	fmt.Fprintf(os.Stderr, "%s%s: %v%s\n", R, prefix, self.what(), RST)
+func fatal(exc *Exception, code int, prefix string) {
+	fmt.Fprintf(os.Stderr, "%s%s: %v%s\n", R, prefix, exc, RST)
 	os.Exit(code)
-}
-
-func newException(e error) *Exception {
-	return &Exception{
-		what: func() error {
-			return e
-		},
-	}
-}
-
-func fmtException(format string, args ...any) *Exception {
-	return newException(fmt.Errorf(format, args...))
-}
-
-func try(cb func()) (err *Exception) {
-	defer func() {
-		if rec := recover(); rec != nil {
-			if exc, ok := rec.(*Exception); ok {
-				err = exc
-			} else {
-				// personality check failed
-				panic(rec)
-			}
-		}
-	}()
-
-	cb()
-
-	return nil
 }
 
 const (
@@ -119,9 +76,7 @@ type Graph struct {
 func newGraph(r io.Reader) *Graph {
 	graph := &Graph{}
 
-	if err := json.NewDecoder(r).Decode(graph); err != nil {
-		fmtException("can not parse input graph: %w", err).throw()
-	}
+	Throw(json.NewDecoder(r).Decode(graph))
 
 	return graph
 }
@@ -192,17 +147,16 @@ func moveToTrash(trashDir, d string) {
 		return
 	}
 
-	if rmErr := os.RemoveAll(d); rmErr != nil && !os.IsNotExist(rmErr) {
-		fmtException("rm %s: %w", d, rmErr).throw()
+	rmErr := os.RemoveAll(d)
+
+	if rmErr != nil && !os.IsNotExist(rmErr) {
+		Throw(rmErr)
 	}
 }
 
 func prepareDir(trashDir, d string) {
 	moveToTrash(trashDir, d)
-
-	if err := os.MkdirAll(d, 0755); err != nil {
-		fmtException("mkdir %s: %w", d, err).throw()
-	}
+	Throw(os.MkdirAll(d, 0755))
 }
 
 func cat[T any](a []T, b []T) []T {
@@ -232,13 +186,17 @@ func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 	for i := range node.Cmds {
 		cmd := &node.Cmds[i]
 
-		if err := runWrapped(cmd, node, envMap(cmd, thrs), out); err != nil {
-			for _, d := range node.OutDirs {
-				moveToTrash(self.trashDir, d)
-			}
+		err := runWrapped(cmd, node, envMap(cmd, thrs), out)
 
-			fmtException("%v failed with %w", cat(nouts, cmd.Args), err).throw()
+		if err == nil {
+			continue
 		}
+
+		for _, d := range node.OutDirs {
+			moveToTrash(self.trashDir, d)
+		}
+
+		ThrowFmt("%v failed with %w", cat(nouts, cmd.Args), err)
 	}
 
 	if node.Tmp != "" {
@@ -309,9 +267,7 @@ func newExecutor(graph *Graph) *executor {
 		trashDir: graph.TrashDir,
 	}
 
-	if err := os.MkdirAll(res.trashDir, 0755); err != nil {
-		fmtException("mkdir trash %s: %w", res.trashDir, err).throw()
-	}
+	Throw(os.MkdirAll(res.trashDir, 0755))
 
 	// construct backrefs
 	for i := range graph.Nodes {
@@ -320,7 +276,7 @@ func newExecutor(graph *Graph) *executor {
 
 		for _, out := range outs(node) {
 			if _, ok := res.out[out]; ok {
-				fmtException("multiple nodes generate output %s", out).throw()
+				ThrowFmt("multiple nodes generate output %s", out)
 			}
 
 			res.out[out] = futu
@@ -339,12 +295,12 @@ func newExecutor(graph *Graph) *executor {
 	for _, node := range graph.Nodes {
 		for _, in := range ins(&node) {
 			if _, ok := res.out[in]; !ok {
-				fmtException("no node generate %s", in).throw()
+				ThrowFmt("no node generate %s", in)
 			}
 		}
 
 		if _, ok := res.sem[node.Pool]; !ok {
-			fmtException("bad pool %s", node.Pool).throw()
+			ThrowFmt("bad pool %s", node.Pool)
 		}
 	}
 
@@ -362,10 +318,10 @@ func (self *executor) visitAll(nodes []string) {
 		go func() {
 			defer wg.Done()
 
-			try(func() {
+			Try(func() {
 				f.callOnce()
-			}).catch(func(exc *Exception) {
-				exc.fatal(2, "subcommand error")
+			}).Catch(func(exc *Exception) {
+				fatal(exc, 2, "subcommand error")
 			})
 		}()
 	}
@@ -375,18 +331,18 @@ func (self *executor) visitAll(nodes []string) {
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "exec" {
-		try(func() {
+		Try(func() {
 			cliExec()
-		}).catch(func(exc *Exception) {
-			exc.fatal(2, "assemble exec")
+		}).Catch(func(exc *Exception) {
+			fatal(exc, 2, "assemble exec")
 		})
 
 		return
 	}
 
-	try(func() {
+	Try(func() {
 		newGraph(os.Stdin).execute()
-	}).catch(func(exc *Exception) {
-		exc.fatal(1, "abort")
+	}).Catch(func(exc *Exception) {
+		fatal(exc, 1, "abort")
 	})
 }

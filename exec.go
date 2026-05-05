@@ -20,8 +20,10 @@ type ExecCfg struct {
 }
 
 func mountSyscall(source, target, fstype string, flags uintptr, data string) {
-	if err := unix.Mount(source, target, fstype, flags, data); err != nil {
-		fmtException("mount %s -> %s (fs=%s flags=%x): %w", source, target, fstype, flags, err).throw()
+	err := unix.Mount(source, target, fstype, flags, data)
+
+	if err != nil {
+		ThrowFmt("mount %s -> %s (fs=%s flags=%x): %w", source, target, fstype, flags, err)
 	}
 }
 
@@ -31,51 +33,74 @@ func bindRO(src, dst string) {
 }
 
 func mkdirAll(p string) {
-	if err := os.MkdirAll(p, 0755); err != nil {
-		fmtException("mkdir %s: %w", p, err).throw()
-	}
+	Throw(os.MkdirAll(p, 0755))
 }
 
-func mkdir(p string) {
-	if err := os.Mkdir(p, 0755); err != nil {
-		fmtException("mkdir %s: %w", p, err).throw()
-	}
+func setupTmpfs(target string) {
+	mountSyscall("tmpfs", target, "tmpfs", 0, "")
 }
 
-func setupTmpfs(buildRoot, ixRoot string) {
-	mkdirAll(buildRoot)
-	mountSyscall("tmpfs", buildRoot, "tmpfs", 0, "")
-
-	trashInside := filepath.Join(buildRoot, ".trash")
-	mkdir(trashInside)
-
-	trash := filepath.Join(ixRoot, "trash")
-	mkdirAll(trash)
-	mountSyscall(trashInside, trash, "", unix.MS_BIND, "")
-}
-
-func setupShadow(inDirs []string, outDir, buildRoot, ixRoot string) {
-	realStore := filepath.Join(ixRoot, "store")
-	shadowStore := filepath.Join(buildRoot, ".shadow", "store")
-	mkdirAll(shadowStore)
-
+func setupShadow(inDirs []string, outDirs []string, storeInside string) {
 	for _, d := range inDirs {
-		target := filepath.Join(shadowStore, filepath.Base(d))
+		target := filepath.Join(storeInside, filepath.Base(d))
 		mkdirAll(target)
 		bindRO(d, target)
 	}
 
-	if outDir != "" {
-		mkdirAll(outDir)
-		target := filepath.Join(shadowStore, filepath.Base(outDir))
+	for _, d := range outDirs {
+		mkdirAll(d)
+		target := filepath.Join(storeInside, filepath.Base(d))
 		mkdirAll(target)
-		mountSyscall(outDir, target, "", unix.MS_BIND, "")
+		mountSyscall(d, target, "", unix.MS_BIND, "")
 	}
-
-	mountSyscall(shadowStore, realStore, "", unix.MS_BIND|unix.MS_REC, "")
 }
 
-func setupMounts(n *Node) {
+func copyFileMode(src, dst string, mode os.FileMode) {
+	data := Throw2(os.ReadFile(src))
+	Throw(os.WriteFile(dst, data, mode))
+}
+
+func copyTree(src, dst string) {
+	Throw(filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		rel, err := filepath.Rel(src, path)
+
+		if err != nil {
+			return err
+		}
+
+		target := filepath.Join(dst, rel)
+
+		if info.IsDir() {
+			return os.MkdirAll(target, info.Mode().Perm())
+		}
+
+		if info.Mode()&os.ModeSymlink != 0 {
+			link, err := os.Readlink(path)
+
+			if err != nil {
+				return err
+			}
+
+			return os.Symlink(link, target)
+		}
+
+		data, err := os.ReadFile(path)
+
+		if err != nil {
+			return err
+		}
+
+		return os.WriteFile(target, data, info.Mode().Perm())
+	}))
+}
+
+func setupRoot(cfg *ExecCfg) {
+	n := &cfg.Node
+
 	if !n.Isolate && !n.Tmpfs {
 		return
 	}
@@ -87,19 +112,82 @@ func setupMounts(n *Node) {
 	buildRoot := filepath.Dir(n.Tmp)
 	ixRoot := filepath.Dir(buildRoot)
 
-	if n.Tmpfs {
-		setupTmpfs(buildRoot, ixRoot)
+	prepRoot := filepath.Join(n.Tmp, "root")
+	mkdirAll(prepRoot)
+	mountSyscall(prepRoot, prepRoot, "", unix.MS_BIND, "")
+
+	inside := func(p string) string {
+		return filepath.Join(prepRoot, strings.TrimPrefix(p, "/"))
 	}
+
+	procDir := inside("/proc")
+	mkdirAll(procDir)
+	mountSyscall("/proc", procDir, "", unix.MS_BIND|unix.MS_REC, "")
+
+	devDir := inside("/dev")
+	mkdirAll(devDir)
+
+	for _, d := range []string{"null", "zero", "random", "urandom"} {
+		target := filepath.Join(devDir, d)
+		Throw2(os.Create(target)).Close()
+		mountSyscall("/dev/"+d, target, "", unix.MS_BIND, "")
+	}
+
+	for _, s := range []string{"stdin", "stdout", "stderr"} {
+		link := Throw2(os.Readlink("/dev/" + s))
+		Throw(os.Symlink(link, filepath.Join(devDir, s)))
+	}
+
+	shmDir := filepath.Join(devDir, "shm")
+	mkdirAll(shmDir)
+	mountSyscall("/dev/shm", shmDir, "", unix.MS_BIND, "")
+
+	binDir := inside("/bin")
+	mkdirAll(binDir)
+	copyFileMode(lookupPathExec("sh", cfg.Env["PATH"]), filepath.Join(binDir, "sh"), 0755)
+
+	usrBinDir := inside("/usr/bin")
+	mkdirAll(usrBinDir)
+	copyFileMode(lookupPathExec("env", cfg.Env["PATH"]), filepath.Join(usrBinDir, "env"), 0755)
+
+	etcDir := inside("/etc")
+	mkdirAll(etcDir)
+	Throw(os.WriteFile(filepath.Join(etcDir, "passwd"), []byte("root:x:0:0:none:/:/bin/sh\n"), 0644))
+	Throw(os.WriteFile(filepath.Join(etcDir, "group"), []byte("root:x:0:\n"), 0644))
+
+	if _, err := os.Stat("/etc/resolv.conf"); err == nil {
+		copyFileMode("/etc/resolv.conf", filepath.Join(etcDir, "resolv.conf"), 0644)
+	}
+
+	if _, err := os.Stat("/etc/ssl"); err == nil {
+		copyTree("/etc/ssl", filepath.Join(etcDir, "ssl"))
+	}
+
+	storeInside := inside(filepath.Join(ixRoot, "store"))
+	mkdirAll(storeInside)
 
 	if n.Isolate {
-		outDir := ""
-
-		if len(n.OutDirs) > 0 {
-			outDir = n.OutDirs[0]
-		}
-
-		setupShadow(n.InDirs, outDir, buildRoot, ixRoot)
+		setupShadow(n.InDirs, n.OutDirs, storeInside)
+	} else {
+		mountSyscall(filepath.Join(ixRoot, "store"), storeInside, "", unix.MS_BIND|unix.MS_REC, "")
 	}
+
+	buildInside := inside(filepath.Join(ixRoot, "build"))
+	mkdirAll(buildInside)
+
+	if n.Tmpfs {
+		setupTmpfs(buildInside)
+		mkdirAll(filepath.Join(buildInside, filepath.Base(n.Tmp)))
+	} else {
+		mountSyscall(buildRoot, buildInside, "", unix.MS_BIND|unix.MS_REC, "")
+	}
+
+	putOld := filepath.Join(prepRoot, "old_root")
+	mkdirAll(putOld)
+	Throw(unix.PivotRoot(prepRoot, putOld))
+	Throw(os.Chdir("/"))
+	Throw(unix.Unmount("/old_root", unix.MNT_DETACH))
+	Throw(os.Remove("/old_root"))
 }
 
 func lookupPathExec(prog, path string) string {
@@ -109,13 +197,14 @@ func lookupPathExec(prog, path string) string {
 
 	for _, p := range strings.Split(path, ":") {
 		full := filepath.Join(p, prog)
+		info, err := os.Stat(full)
 
-		if info, err := os.Stat(full); err == nil && !info.IsDir() {
+		if err == nil && !info.IsDir() {
 			return full
 		}
 	}
 
-	fmtException("cannot find %q in PATH=%q", prog, path).throw()
+	ThrowFmt("cannot find %q in PATH=%q", prog, path)
 	panic(nil)
 }
 
@@ -130,63 +219,38 @@ func envToList(env map[string]string) []string {
 }
 
 func selfPath() string {
-	p, err := os.Executable()
-
-	if err != nil {
-		fmtException("os.Executable: %w", err).throw()
-	}
-
-	return p
+	return Throw2(os.Executable())
 }
 
-func dupFromMemfd(name string, payload []byte) {
-	fd, err := unix.MemfdCreate(name, 0)
+func dupStdinFromBytes(payload []byte) {
+	r, w := Throw3(os.Pipe())
 
-	if err != nil {
-		fmtException("memfd_create: %w", err).throw()
+	if len(payload) > 0 {
+		Throw2(unix.FcntlInt(w.Fd(), unix.F_SETPIPE_SZ, len(payload)))
+		Throw2(w.Write(payload))
 	}
 
-	for len(payload) > 0 {
-		n, err := unix.Write(fd, payload)
-
-		if err != nil {
-			fmtException("write memfd: %w", err).throw()
-		}
-
-		payload = payload[n:]
-	}
-
-	if _, err := unix.Seek(fd, 0, 0); err != nil {
-		fmtException("seek memfd: %w", err).throw()
-	}
-
-	if err := unix.Dup2(fd, 0); err != nil {
-		fmtException("dup2 memfd: %w", err).throw()
-	}
-
-	unix.Close(fd)
+	Throw(w.Close())
+	Throw(unix.Dup2(int(r.Fd()), 0))
+	Throw(r.Close())
 }
 
 func cliExec() {
 	var cfg ExecCfg
 
-	if err := json.NewDecoder(os.Stdin).Decode(&cfg); err != nil {
-		fmtException("decode cfg: %w", err).throw()
-	}
+	Throw(json.NewDecoder(os.Stdin).Decode(&cfg))
 
 	if len(cfg.Cmd.Args) == 0 {
-		fmtException("empty args").throw()
+		ThrowFmt("empty args")
 	}
 
-	setupMounts(&cfg.Node)
+	setupRoot(&cfg)
 
 	prog := lookupPathExec(cfg.Cmd.Args[0], cfg.Env["PATH"])
 
-	dupFromMemfd("cmd-stdin", []byte(cfg.Cmd.Stdin))
+	dupStdinFromBytes([]byte(cfg.Cmd.Stdin))
 
-	if err := syscall.Exec(prog, cfg.Cmd.Args, envToList(cfg.Env)); err != nil {
-		fmtException("exec %s: %w", prog, err).throw()
-	}
+	Throw(syscall.Exec(prog, cfg.Cmd.Args, envToList(cfg.Env)))
 }
 
 func runWrapped(c *Cmd, n *Node, env map[string]string, out io.Writer) error {
@@ -205,17 +269,8 @@ func runWrapped(c *Cmd, n *Node, env map[string]string, out io.Writer) error {
 		return cmd.Run()
 	}
 
-	payload, err := json.Marshal(ExecCfg{Node: *n, Cmd: *c, Env: env})
-
-	if err != nil {
-		fmtException("marshal cfg: %w", err).throw()
-	}
-
-	unsharePath, err := exec.LookPath("unshare")
-
-	if err != nil {
-		fmtException("find unshare: %w", err).throw()
-	}
+	payload := Throw2(json.Marshal(ExecCfg{Node: *n, Cmd: *c, Env: env}))
+	unsharePath := Throw2(exec.LookPath("unshare"))
 
 	args := []string{"unshare", "-U", "-m", "-r"}
 
