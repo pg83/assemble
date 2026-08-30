@@ -15,8 +15,12 @@ import (
 )
 
 func fatal(exc *Exception, code int, prefix string) {
-	fmt.Fprintf(os.Stderr, "%s%s: %v%s\n", R, prefix, exc, RST)
+	printException(exc, prefix)
 	os.Exit(code)
+}
+
+func printException(exc *Exception, prefix string) {
+	fmt.Fprintf(os.Stderr, "%s%s: %v%s\n", R, prefix, exc, RST)
 }
 
 const (
@@ -89,8 +93,8 @@ func newGraph(r io.Reader) *Graph {
 	return graph
 }
 
-func (self *Graph) execute() {
-	newExecutor(self).visitAll(self.Targets)
+func (self *Graph) execute() bool {
+	return anyFailed(newExecutor(self).visitAll(self.Targets))
 }
 
 func toFiles(dirs []string) []string {
@@ -243,54 +247,89 @@ func (self *executor) executeNode(node *Node, thrs int, out io.Writer) {
 }
 
 type future struct {
-	f func()
-	o sync.Once
+	f      func() bool
+	o      sync.Once
+	failed bool
 }
 
-func (self *future) callOnce() {
-	self.o.Do(self.f)
+func (self *future) callOnce() bool {
+	self.o.Do(func() {
+		self.failed = self.f()
+	})
+
+	return self.failed
 }
 
 type executor struct {
-	thr      int
-	trashDir string
-	out      map[string]*future
-	sem      map[string]*semaphore
-	wait     atomic.Uint64
-	done     atomic.Uint64
+	thr       int
+	trashDir  string
+	out       map[string]*future
+	sem       map[string]*semaphore
+	wait      atomic.Uint64
+	done      atomic.Uint64
+	keepGoing bool
 }
 
 func (self *executor) complete() string {
 	return fmt.Sprintf("{%d/%d}", self.done.Load()+1, self.wait.Load())
 }
 
-func (self *executor) execute(node *Node) {
+func (self *executor) execute(node *Node) bool {
 	buf := os.Stdout
 
 	if complete(node, buf) {
-		return
+		return false
 	}
 
 	self.wait.Add(1)
 	defer self.done.Add(1)
-	self.visitAll(ins(node))
+
+	inputs := ins(node)
+	depResults := self.visitAll(inputs)
+
+	for i, failed := range depResults {
+		if failed {
+			for _, out := range outs(node) {
+				fmt.Fprintln(buf, color(R, self.complete()+" BROKEN BY DEP "+inputs[i]+" "+out))
+			}
+
+			return true
+		}
+	}
+
 	sem, _ := self.sem[node.Pool]
 	sem.acquire()
 	defer sem.release()
-	self.executeNode(node, self.thr, buf)
+
+	exc := Try(func() {
+		self.executeNode(node, self.thr, buf)
+	})
+
+	if exc != nil {
+		printException(exc, "subcommand error")
+
+		if !self.keepGoing {
+			os.Exit(2)
+		}
+
+		return true
+	}
+
+	return false
 }
 
 func newNodeFuture(ex *executor, node *Node) *future {
-	return &future{f: func() {
-		ex.execute(node)
+	return &future{f: func() bool {
+		return ex.execute(node)
 	}}
 }
 
 func newExecutor(graph *Graph) *executor {
 	res := &executor{
-		out:      map[string]*future{},
-		sem:      map[string]*semaphore{},
-		trashDir: graph.TrashDir,
+		out:       map[string]*future{},
+		sem:       map[string]*semaphore{},
+		trashDir:  graph.TrashDir,
+		keepGoing: os.Getenv("IX_KEEP_GOING") == "yes",
 	}
 
 	Throw(os.MkdirAll(res.trashDir, 0755))
@@ -333,26 +372,34 @@ func newExecutor(graph *Graph) *executor {
 	return res
 }
 
-func (self *executor) visitAll(nodes []string) {
+func (self *executor) visitAll(nodes []string) []bool {
 	wg := &sync.WaitGroup{}
+	results := make([]bool, len(nodes))
 
-	for _, n := range nodes {
+	for i, n := range nodes {
 		f := self.out[n]
 
 		wg.Add(1)
 
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-
-			Try(func() {
-				f.callOnce()
-			}).Catch(func(exc *Exception) {
-				fatal(exc, 2, "subcommand error")
-			})
-		}()
+			results[idx] = f.callOnce()
+		}(i)
 	}
 
 	wg.Wait()
+
+	return results
+}
+
+func anyFailed(results []bool) bool {
+	for _, failed := range results {
+		if failed {
+			return true
+		}
+	}
+
+	return false
 }
 
 func main() {
@@ -366,9 +413,15 @@ func main() {
 		return
 	}
 
+	failed := false
+
 	Try(func() {
-		newGraph(os.Stdin).execute()
+		failed = newGraph(os.Stdin).execute()
 	}).Catch(func(exc *Exception) {
 		fatal(exc, 1, "abort")
 	})
+
+	if failed {
+		os.Exit(2)
+	}
 }

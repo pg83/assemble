@@ -18,6 +18,9 @@ Reads the same JSON graph shape as the old `assemble`:
 }
 ```
 
+Execution is fail-fast by default. Set `IX_KEEP_GOING=yes` to finish
+independent graph branches after a node fails; dependent nodes are skipped.
+
 Per-node `tmpfs` flag (planned) toggles the sandbox off for nodes
 that need to write into real `/ix/store` (e.g. fetch nodes with
 content-addressed predict outputs).
