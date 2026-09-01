@@ -67,6 +67,7 @@ type Predict struct {
 }
 
 type Node struct {
+	UID     string    `json:"uid"`
 	InDirs  []string  `json:"in_dir"`
 	OutDirs []string  `json:"out_dir"`
 	Cmds    []Cmd     `json:"cmd"`
@@ -268,6 +269,7 @@ type executor struct {
 	wait      atomic.Uint64
 	done      atomic.Uint64
 	keepGoing bool
+	cache     *packageCache
 }
 
 func (self *executor) complete() string {
@@ -283,6 +285,30 @@ func (self *executor) execute(node *Node) bool {
 
 	self.wait.Add(1)
 	defer self.done.Add(1)
+
+	if self.cache.has(node.UID) {
+		sem := self.sem["network"]
+		sem.acquire()
+		defer sem.release()
+
+		fmt.Fprintln(buf, color(M, self.complete()+" CACHE "+node.OutDirs[0]+" "+node.UID))
+
+		exc := Try(func() {
+			self.executeCached(node, buf)
+		})
+
+		if exc != nil {
+			printException(exc, "cache error")
+
+			if !self.keepGoing {
+				os.Exit(2)
+			}
+
+			return true
+		}
+
+		return false
+	}
 
 	inputs := ins(node)
 	depResults := self.visitAll(inputs)
@@ -368,6 +394,8 @@ func newExecutor(graph *Graph) *executor {
 			ThrowFmt("bad pool %s", node.Pool)
 		}
 	}
+
+	res.cache = newPackageCache(os.Getenv("IX_PACKAGE_CACHE"), graph.Nodes)
 
 	return res
 }
