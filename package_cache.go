@@ -76,6 +76,10 @@ func newPackageCache(raw string, nodes []Node) *packageCache {
 		return cache
 	}
 
+	rand.Shuffle(len(cache.endpoints), func(i, j int) {
+		cache.endpoints[i], cache.endpoints[j] = cache.endpoints[j], cache.endpoints[i]
+	})
+
 	uids := make([]string, 0, len(nodes))
 
 	for _, node := range nodes {
@@ -93,62 +97,98 @@ func (c *packageCache) has(uid string) bool {
 	return c != nil && uid != "" && c.available[uid]
 }
 
+type cacheResolveResult struct {
+	endpoint  string
+	available []string
+	err       error
+}
+
+func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload []byte) cacheResolveResult {
+	result := cacheResolveResult{endpoint: endpoint}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/v1/resolve", bytes.NewReader(payload))
+
+	if err != nil {
+		result.err = err
+
+		return result
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+
+	if err != nil {
+		result.err = err
+
+		return result
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		_ = resp.Body.Close()
+		result.err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+
+		return result
+	}
+
+	err = json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&result.available)
+	closeErr := resp.Body.Close()
+
+	if err != nil || closeErr != nil {
+		result.err = fmt.Errorf("bad response: %v %v", err, closeErr)
+	}
+
+	return result
+}
+
 func (c *packageCache) resolve(uids []string) map[string]bool {
 	payload := Throw2(json.Marshal(uids))
 	timeouts := &retryTimeouts{}
+	width := 2
+	next := 0
 
-	for attempt := 0; ; attempt++ {
-		endpoint := c.endpoints[attempt%len(c.endpoints)]
+	if len(c.endpoints) < width {
+		width = len(c.endpoints)
+	}
+
+	for {
 		tout := timeouts.next()
 		ctx, cancel := context.WithTimeout(context.Background(), tout)
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/v1/resolve", bytes.NewReader(payload))
+		results := make(chan cacheResolveResult, width)
 
-		if err != nil {
-			cancel()
-			Throw(err)
+		for offset := 0; offset < width; offset++ {
+			endpoint := c.endpoints[(next+offset)%len(c.endpoints)]
+
+			go func() {
+				results <- c.resolveFrom(ctx, endpoint, payload)
+			}()
 		}
 
-		req.Header.Set("Content-Type", "application/json")
-		resp, err := c.http.Do(req)
+		next = (next + width) % len(c.endpoints)
 
-		if err != nil {
+		for range width {
+			resolved := <-results
+
+			if resolved.err != nil {
+				fmt.Fprintf(os.Stderr, "package cache resolve %s: %v, cycling endpoints\n",
+					resolved.endpoint, resolved.err)
+
+				continue
+			}
+
 			cancel()
-			fmt.Fprintf(os.Stderr, "package cache resolve %s: %v, cycling endpoints\n", endpoint, err)
+			result := make(map[string]bool, len(resolved.available))
 
-			continue
+			for _, uid := range resolved.available {
+				result[uid] = true
+			}
+
+			fmt.Fprintf(os.Stderr, "package cache: resolved %d/%d nodes via %s\n",
+				len(result), len(uids), resolved.endpoint)
+
+			return result
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-			_ = resp.Body.Close()
-			cancel()
-			fmt.Fprintf(os.Stderr, "package cache resolve %s: HTTP %d: %s, cycling endpoints\n",
-				endpoint, resp.StatusCode, strings.TrimSpace(string(body)))
-
-			continue
-		}
-
-		var available []string
-		err = json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&available)
-		closeErr := resp.Body.Close()
 		cancel()
-
-		if err != nil || closeErr != nil {
-			fmt.Fprintf(os.Stderr, "package cache resolve %s: bad response: %v %v, cycling endpoints\n",
-				endpoint, err, closeErr)
-
-			continue
-		}
-
-		result := make(map[string]bool, len(available))
-
-		for _, uid := range available {
-			result[uid] = true
-		}
-
-		fmt.Fprintf(os.Stderr, "package cache: resolved %d/%d nodes via %s\n", len(result), len(uids), endpoint)
-
-		return result
 	}
 }
 
