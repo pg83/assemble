@@ -66,6 +66,18 @@ func parseCacheEndpoints(raw string) []string {
 	return result
 }
 
+func isLoopbackEndpoint(endpoint string) bool {
+	parsed, err := url.Parse(endpoint)
+
+	if err != nil {
+		return false
+	}
+
+	host := parsed.Hostname()
+
+	return host == "localhost" || host == "::1" || strings.HasPrefix(host, "127.")
+}
+
 func newPackageCache(raw string, nodes []Node) *packageCache {
 	cache := &packageCache{
 		endpoints: parseCacheEndpoints(raw),
@@ -78,8 +90,21 @@ func newPackageCache(raw string, nodes []Node) *packageCache {
 		return cache
 	}
 
-	rand.Shuffle(len(cache.endpoints), func(i, j int) {
-		cache.endpoints[i], cache.endpoints[j] = cache.endpoints[j], cache.endpoints[i]
+	// Loopback endpoints stay in front so a co-hosted cache is always tried
+	// first; only the remote tail is shuffled for load spreading.
+	local := 0
+
+	for index, endpoint := range cache.endpoints {
+		if isLoopbackEndpoint(endpoint) {
+			cache.endpoints[local], cache.endpoints[index] = cache.endpoints[index], cache.endpoints[local]
+			local++
+		}
+	}
+
+	remote := cache.endpoints[local:]
+
+	rand.Shuffle(len(remote), func(i, j int) {
+		remote[i], remote[j] = remote[j], remote[i]
 	})
 
 	uids := make([]string, 0, len(nodes))

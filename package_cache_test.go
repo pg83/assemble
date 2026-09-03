@@ -107,6 +107,44 @@ func TestPackageCacheResolveCyclesEndpoints(t *testing.T) {
 	}
 }
 
+func TestIsLoopbackEndpoint(t *testing.T) {
+	for endpoint, want := range map[string]bool{
+		"http://127.0.0.1:8054":       true,
+		"http://127.1.2.3:8054":       true,
+		"http://localhost:8054":       true,
+		"http://192.168.103.16:8054":  false,
+		"http://cache.example.com:80": false,
+	} {
+		if isLoopbackEndpoint(endpoint) != want {
+			t.Fatalf("isLoopbackEndpoint(%q) != %v", endpoint, want)
+		}
+	}
+}
+
+func TestPackageCacheTriesLoopbackFirst(t *testing.T) {
+	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode([]string{"cached"})
+	}))
+	defer local.Close()
+
+	// Unroutable remotes listed before the loopback server: if ordering did
+	// not move loopback to the front, resolve would stall dialing them.
+	raw := "10.255.255.1:9," + local.URL + ",10.255.255.2:9"
+	cache := newPackageCache(raw, []Node{{UID: "cached"}})
+
+	if cache.endpoints[0] != local.URL {
+		t.Fatalf("endpoints=%v", cache.endpoints)
+	}
+
+	if len(cache.endpoints) != 3 {
+		t.Fatalf("endpoints=%v", cache.endpoints)
+	}
+
+	if !cache.has("cached") {
+		t.Fatalf("available=%v", cache.available)
+	}
+}
+
 func TestPackageCacheResolveDropsPermanentEndpoint(t *testing.T) {
 	var calls atomic.Int32
 	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
