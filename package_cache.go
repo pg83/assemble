@@ -24,6 +24,7 @@ type packageCache struct {
 	endpoints []string
 	available map[string]bool
 	http      *http.Client
+	sleep     func(time.Duration)
 }
 
 type retryTimeouts struct {
@@ -38,8 +39,8 @@ func (r *retryTimeouts) next() time.Duration {
 	result := time.Duration(float64(r.current) * (0.5 + rand.Float64()))
 	r.current = time.Duration(float64(r.current) * 1.5)
 
-	if r.current > 10000*time.Second {
-		r.current = 10000 * time.Second
+	if r.current > 1000*time.Second {
+		r.current = 1000 * time.Second
 	}
 
 	return result
@@ -70,6 +71,7 @@ func newPackageCache(raw string, nodes []Node) *packageCache {
 		endpoints: parseCacheEndpoints(raw),
 		available: map[string]bool{},
 		http:      &http.Client{},
+		sleep:     time.Sleep,
 	}
 
 	if len(cache.endpoints) == 0 {
@@ -101,6 +103,11 @@ type cacheResolveResult struct {
 	endpoint  string
 	available []string
 	err       error
+	infra     bool
+}
+
+func cacheInfraStatus(code int) bool {
+	return code == http.StatusTooManyRequests || code >= 500
 }
 
 func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload []byte) cacheResolveResult {
@@ -118,6 +125,7 @@ func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload
 
 	if err != nil {
 		result.err = err
+		result.infra = true
 
 		return result
 	}
@@ -126,15 +134,29 @@ func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
 		result.err = fmt.Errorf("HTTP %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+		result.infra = cacheInfraStatus(resp.StatusCode)
 
 		return result
 	}
 
-	err = json.NewDecoder(io.LimitReader(resp.Body, 64<<20)).Decode(&result.available)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, (64<<20)+1))
 	closeErr := resp.Body.Close()
 
 	if err != nil || closeErr != nil {
 		result.err = fmt.Errorf("bad response: %v %v", err, closeErr)
+		result.infra = true
+
+		return result
+	}
+
+	if len(body) > 64<<20 {
+		result.err = fmt.Errorf("response exceeds 64 MiB")
+
+		return result
+	}
+
+	if err := json.Unmarshal(body, &result.available); err != nil {
+		result.err = fmt.Errorf("bad response: %v", err)
 	}
 
 	return result
@@ -142,54 +164,61 @@ func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload
 
 func (c *packageCache) resolve(uids []string) map[string]bool {
 	payload := Throw2(json.Marshal(uids))
-	timeouts := &retryTimeouts{}
-	width := 2
-	next := 0
+	timeouts := &retryTimeouts{current: 10 * time.Second}
+	good := append([]string{}, c.endpoints...)
+	attempt := 0
+	index := 0
 
-	if len(c.endpoints) < width {
-		width = len(c.endpoints)
-	}
-
-	for {
-		tout := timeouts.next()
-		ctx, cancel := context.WithTimeout(context.Background(), tout)
-		results := make(chan cacheResolveResult, width)
-
-		for offset := 0; offset < width; offset++ {
-			endpoint := c.endpoints[(next+offset)%len(c.endpoints)]
-
-			go func() {
-				results <- c.resolveFrom(ctx, endpoint, payload)
-			}()
+	for len(good) > 0 {
+		if index >= len(good) {
+			index = 0
 		}
 
-		next = (next + width) % len(c.endpoints)
+		endpoint := good[index]
+		tout := timeouts.next()
 
-		for range width {
-			resolved := <-results
+		if attempt > 0 {
+			c.sleep(tout / 10)
+		}
 
-			if resolved.err != nil {
-				fmt.Fprintf(os.Stderr, "package cache resolve %s: %v, cycling endpoints\n",
+		attempt++
+		ctx, cancel := context.WithTimeout(context.Background(), tout)
+		resolved := c.resolveFrom(ctx, endpoint, payload)
+		cancel()
+
+		if resolved.err != nil {
+			if resolved.infra {
+				fmt.Fprintf(os.Stderr, "package cache resolve %s: infrastructure error: %v, cycling endpoints\n",
 					resolved.endpoint, resolved.err)
+				index++
 
 				continue
 			}
 
-			cancel()
-			result := make(map[string]bool, len(resolved.available))
+			fmt.Fprintf(os.Stderr, "package cache resolve %s: permanent error: %v, dropping endpoint\n",
+				resolved.endpoint, resolved.err)
+			good = removeEndpoint(good, index)
 
-			for _, uid := range resolved.available {
-				result[uid] = true
-			}
-
-			fmt.Fprintf(os.Stderr, "package cache: resolved %d/%d nodes via %s\n",
-				len(result), len(uids), resolved.endpoint)
-
-			return result
+			continue
 		}
 
-		cancel()
+		result := make(map[string]bool, len(resolved.available))
+
+		for _, uid := range resolved.available {
+			result[uid] = true
+		}
+
+		c.endpoints = good
+		fmt.Fprintf(os.Stderr, "package cache: resolved %d/%d nodes via %s\n",
+			len(result), len(uids), resolved.endpoint)
+
+		return result
 	}
+
+	c.endpoints = nil
+	fmt.Fprintln(os.Stderr, "package cache: no usable resolve endpoints, continuing without cache")
+
+	return map[string]bool{}
 }
 
 func removeEndpoint(items []string, index int) []string {

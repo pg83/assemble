@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/klauspost/compress/zstd"
 )
@@ -82,7 +83,16 @@ func TestPackageCacheResolveCyclesEndpoints(t *testing.T) {
 	}))
 	defer good.Close()
 
-	cache := newPackageCache(failed.URL+","+good.URL, []Node{{UID: "cached"}, {UID: "local"}})
+	var sleeps []time.Duration
+	cache := &packageCache{
+		endpoints: []string{failed.URL, good.URL},
+		available: map[string]bool{},
+		http:      &http.Client{},
+		sleep: func(delay time.Duration) {
+			sleeps = append(sleeps, delay)
+		},
+	}
+	cache.available = cache.resolve([]string{"cached", "local"})
 
 	if !cache.has("cached") || cache.has("local") {
 		t.Fatalf("available=%v", cache.available)
@@ -90,6 +100,103 @@ func TestPackageCacheResolveCyclesEndpoints(t *testing.T) {
 
 	if failedCalls.Load() != 1 {
 		t.Fatalf("failed endpoint calls=%d", failedCalls.Load())
+	}
+
+	if len(sleeps) != 1 || sleeps[0] < 750*time.Millisecond || sleeps[0] >= 2250*time.Millisecond {
+		t.Fatalf("retry sleeps=%v", sleeps)
+	}
+}
+
+func TestPackageCacheResolveDropsPermanentEndpoint(t *testing.T) {
+	var calls atomic.Int32
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer bad.Close()
+
+	cache := &packageCache{
+		endpoints: []string{bad.URL},
+		http:      &http.Client{},
+		sleep: func(time.Duration) {
+			t.Fatal("unexpected retry sleep")
+		},
+	}
+
+	if available := cache.resolve([]string{"local"}); len(available) != 0 {
+		t.Fatalf("available=%v", available)
+	}
+
+	if calls.Load() != 1 {
+		t.Fatalf("permanent endpoint calls=%d", calls.Load())
+	}
+
+	if len(cache.endpoints) != 0 {
+		t.Fatalf("remaining endpoints=%v", cache.endpoints)
+	}
+}
+
+func TestPackageCacheResolveExhaustionBuildsLocally(t *testing.T) {
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer bad.Close()
+
+	root := t.TempDir()
+	target := filepath.Join(root, "target")
+	t.Setenv("IX_PACKAGE_CACHE", bad.URL)
+
+	graph := &Graph{
+		Nodes: []Node{{
+			UID:     "local-uid",
+			OutDirs: []string{target},
+			Pool:    "threads",
+		}},
+		Targets:  []string{target + "/touch"},
+		Pools:    map[string]int{"threads": 1, "network": 1},
+		TrashDir: filepath.Join(root, "trash"),
+	}
+
+	if graph.execute() {
+		t.Fatal("local fallback failed")
+	}
+
+	if _, err := os.Stat(target + "/touch"); err != nil {
+		t.Fatalf("local output: %v", err)
+	}
+}
+
+func TestPackageCacheResolveDeadlineSequence(t *testing.T) {
+	timeouts := &retryTimeouts{current: 10 * time.Second}
+	first := timeouts.next()
+
+	if first < 5*time.Second || first >= 15*time.Second {
+		t.Fatalf("first deadline=%v", first)
+	}
+
+	if timeouts.current != 15*time.Second {
+		t.Fatalf("second deadline base=%v", timeouts.current)
+	}
+
+	timeouts.current = 1000 * time.Second
+	_ = timeouts.next()
+
+	if timeouts.current != 1000*time.Second {
+		t.Fatalf("capped deadline base=%v", timeouts.current)
+	}
+}
+
+func TestPackageCacheInfraStatus(t *testing.T) {
+	for _, code := range []int{http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusServiceUnavailable} {
+		if !cacheInfraStatus(code) {
+			t.Fatalf("HTTP %d must be infrastructure failure", code)
+		}
+	}
+
+	for _, code := range []int{http.StatusBadRequest, http.StatusUnauthorized, http.StatusNotFound} {
+		if cacheInfraStatus(code) {
+			t.Fatalf("HTTP %d must be permanent failure", code)
+		}
 	}
 }
 
