@@ -208,14 +208,12 @@ func (c *packageCache) resolve(uids []string) map[string]bool {
 			result[uid] = true
 		}
 
-		c.endpoints = good
 		fmt.Fprintf(os.Stderr, "package cache: resolved %d/%d nodes via %s\n",
 			len(result), len(uids), resolved.endpoint)
 
 		return result
 	}
 
-	c.endpoints = nil
 	fmt.Fprintln(os.Stderr, "package cache: no usable resolve endpoints, continuing without cache")
 
 	return map[string]bool{}

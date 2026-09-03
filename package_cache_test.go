@@ -131,8 +131,53 @@ func TestPackageCacheResolveDropsPermanentEndpoint(t *testing.T) {
 		t.Fatalf("permanent endpoint calls=%d", calls.Load())
 	}
 
-	if len(cache.endpoints) != 0 {
-		t.Fatalf("remaining endpoints=%v", cache.endpoints)
+	if len(cache.endpoints) != 1 || cache.endpoints[0] != bad.URL {
+		t.Fatalf("blob endpoints=%v", cache.endpoints)
+	}
+}
+
+func TestPackageCacheResolveDropDoesNotAffectBlobFetch(t *testing.T) {
+	blob := cacheArchive(t, map[string]string{"value": "from resolve-rejected endpoint"})
+	var blobCalls atomic.Int32
+	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/resolve":
+			http.Error(w, "bad request", http.StatusBadRequest)
+		case "/v1/blob/cached":
+			blobCalls.Add(1)
+			_, _ = w.Write(blob)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer rejected.Close()
+
+	resolver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/resolve":
+			_ = json.NewEncoder(w).Encode([]string{"cached"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer resolver.Close()
+
+	cache := &packageCache{
+		endpoints: []string{rejected.URL, resolver.URL},
+		http:      &http.Client{},
+		sleep:     func(time.Duration) {},
+	}
+	cache.available = cache.resolve([]string{"cached"})
+
+	if !cache.has("cached") {
+		t.Fatalf("available=%v", cache.available)
+	}
+
+	archive := cache.fetch("cached", t.TempDir())
+	defer os.Remove(archive)
+
+	if blobCalls.Load() != 1 {
+		t.Fatalf("blob calls=%d", blobCalls.Load())
 	}
 }
 
