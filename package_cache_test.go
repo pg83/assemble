@@ -173,8 +173,8 @@ func TestPackageCacheResolveDropDoesNotAffectBlobFetch(t *testing.T) {
 		t.Fatalf("available=%v", cache.available)
 	}
 
-	archive := cache.fetch("cached", t.TempDir())
-	defer os.Remove(archive)
+	root := t.TempDir()
+	cache.restore("cached", filepath.Join(root, "out"), filepath.Join(root, "trash"))
 
 	if blobCalls.Load() != 1 {
 		t.Fatalf("blob calls=%d", blobCalls.Load())
@@ -245,7 +245,7 @@ func TestPackageCacheInfraStatus(t *testing.T) {
 	}
 }
 
-func TestPackageCacheFetchDropsNotFoundEndpoint(t *testing.T) {
+func TestPackageCacheRestoreDropsNotFoundEndpoint(t *testing.T) {
 	missing := httptest.NewServer(http.NotFoundHandler())
 	defer missing.Close()
 
@@ -265,20 +265,87 @@ func TestPackageCacheFetchDropsNotFoundEndpoint(t *testing.T) {
 		endpoints: []string{missing.URL, good.URL},
 		http:      &http.Client{},
 	}
-	archive := cache.fetch("cached", t.TempDir())
-	defer os.Remove(archive)
-
-	out := filepath.Join(t.TempDir(), "out")
-
-	if err := os.MkdirAll(out, 0755); err != nil {
-		t.Fatal(err)
-	}
-
-	extractArchive(archive, out)
+	root := t.TempDir()
+	out := filepath.Join(root, "out")
+	cache.restore("cached", out, filepath.Join(root, "trash"))
 	data, err := os.ReadFile(filepath.Join(out, "value"))
 
 	if err != nil || string(data) != "from cache" {
 		t.Fatalf("data=%q err=%v", data, err)
+	}
+}
+
+func TestPackageCacheRestoreStreamsAndResetsPartialOutput(t *testing.T) {
+	brokenBlob := cacheArchive(t, map[string]string{"stale": "partial"})
+	brokenTail := cacheArchive(t, map[string]string{"ignored": "truncated"})
+	brokenBlob = append(brokenBlob, brokenTail[:len(brokenTail)-1]...)
+	goodBlob := cacheArchive(t, map[string]string{"value": "ready"})
+	var brokenCalls atomic.Int32
+	var goodCalls atomic.Int32
+
+	broken := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		brokenCalls.Add(1)
+		_, _ = w.Write(brokenBlob)
+	}))
+	defer broken.Close()
+
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodCalls.Add(1)
+		_, _ = w.Write(goodBlob)
+	}))
+	defer good.Close()
+
+	cache := &packageCache{
+		endpoints: []string{broken.URL, good.URL},
+		http:      &http.Client{},
+	}
+	root := t.TempDir()
+	out := filepath.Join(root, "out")
+	trash := filepath.Join(root, "trash")
+
+	if err := os.MkdirAll(trash, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	cache.restore("cached", out, trash)
+
+	if brokenCalls.Load() != 1 || goodCalls.Load() != 1 {
+		t.Fatalf("endpoint calls: broken=%d good=%d", brokenCalls.Load(), goodCalls.Load())
+	}
+
+	data, err := os.ReadFile(filepath.Join(out, "value"))
+
+	if err != nil || string(data) != "ready" {
+		t.Fatalf("restored output=%q err=%v", data, err)
+	}
+
+	if _, err := os.Stat(filepath.Join(out, "stale")); !os.IsNotExist(err) {
+		t.Fatalf("partial output survived retry: %v", err)
+	}
+
+	partialFound := false
+	err = filepath.WalkDir(trash, func(path string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		if strings.HasSuffix(entry.Name(), ".tar.zst") {
+			t.Fatalf("cache archive written to trash: %s", path)
+		}
+
+		if entry.Name() == "stale" {
+			partialFound = true
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !partialFound {
+		t.Fatal("broken archive did not produce partial output")
 	}
 }
 
@@ -292,8 +359,9 @@ func TestPackageCacheNotFoundEverywhereIsTerminal(t *testing.T) {
 		endpoints: []string{missing1.URL, missing2.URL},
 		http:      &http.Client{},
 	}
+	root := t.TempDir()
 	exc := Try(func() {
-		cache.fetch("gone", t.TempDir())
+		cache.restore("gone", filepath.Join(root, "out"), filepath.Join(root, "trash"))
 	})
 
 	if exc == nil || !strings.Contains(exc.Error(), "not found on any endpoint") {

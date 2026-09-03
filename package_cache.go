@@ -223,10 +223,23 @@ func removeEndpoint(items []string, index int) []string {
 	return append(items[:index], items[index+1:]...)
 }
 
-func (c *packageCache) fetch(uid, trashDir string) string {
+type countingReader struct {
+	io.Reader
+	n int64
+}
+
+func (r *countingReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.n += int64(n)
+
+	return n, err
+}
+
+func (c *packageCache) restore(uid, outDir, trashDir string) {
 	good := append([]string{}, c.endpoints...)
 	timeouts := &retryTimeouts{}
 	index := 0
+	prepareDir(trashDir, outDir)
 
 	for len(good) > 0 {
 		if index >= len(good) {
@@ -274,28 +287,26 @@ func (c *packageCache) fetch(uid, trashDir string) string {
 			continue
 		}
 
-		file := Throw2(os.CreateTemp(trashDir, "assemble-cache-*.tar.zst"))
-		path := file.Name()
-		written, copyErr := io.Copy(file, resp.Body)
+		body := &countingReader{Reader: resp.Body}
+		extractErr := Try(func() {
+			extractArchive(body, outDir)
+		})
 		bodyErr := resp.Body.Close()
-		fileErr := file.Close()
 		cancel()
 
-		if copyErr != nil || bodyErr != nil || fileErr != nil || (resp.ContentLength >= 0 && written != resp.ContentLength) {
-			_ = os.Remove(path)
-			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: incomplete body (%d/%d): %v %v %v, cycling endpoints\n",
-				uid, endpoint, written, resp.ContentLength, copyErr, bodyErr, fileErr)
+		if extractErr != nil || bodyErr != nil || (resp.ContentLength >= 0 && body.n != resp.ContentLength) {
+			prepareDir(trashDir, outDir)
+			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: bad archive (%d/%d): %v %v, cycling endpoints\n",
+				uid, endpoint, body.n, resp.ContentLength, extractErr, bodyErr)
 			index++
 
 			continue
 		}
 
-		return path
+		return
 	}
 
 	ThrowFmt("package cache uid %s: not found on any endpoint", uid)
-
-	return ""
 }
 
 type dirMetadata struct {
@@ -371,11 +382,8 @@ func rejectSymlink(path string) {
 	}
 }
 
-func extractArchive(path, outDir string) {
-	f := Throw2(os.Open(path))
-	defer f.Close()
-
-	decoder := Throw2(zstd.NewReader(f))
+func extractArchive(input io.Reader, outDir string) {
+	decoder := Throw2(zstd.NewReader(input))
 	defer decoder.Close()
 
 	reader := tar.NewReader(decoder)
@@ -428,6 +436,9 @@ func extractArchive(path, outDir string) {
 		Throw(os.Chmod(dirs[i].path, dirs[i].mode))
 		Throw(os.Chtimes(dirs[i].path, dirs[i].modTime, dirs[i].modTime))
 	}
+
+	_, err := io.Copy(io.Discard, decoder)
+	Throw(err)
 }
 
 func (self *executor) executeCached(node *Node, out io.Writer) {
@@ -436,13 +447,9 @@ func (self *executor) executeCached(node *Node, out io.Writer) {
 	}
 
 	outDir := node.OutDirs[0]
-	prepareDir(self.trashDir, outDir)
 
 	exc := Try(func() {
-		archive := self.cache.fetch(node.UID, self.trashDir)
-		defer os.Remove(archive)
-
-		extractArchive(archive, outDir)
+		self.cache.restore(node.UID, outDir, self.trashDir)
 	})
 
 	if exc != nil {
