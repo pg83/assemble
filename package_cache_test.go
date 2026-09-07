@@ -3,6 +3,8 @@ package main
 import (
 	"archive/tar"
 	"bytes"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -63,7 +65,7 @@ func TestPackageCacheResolveCyclesEndpoints(t *testing.T) {
 	defer failed.Close()
 
 	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v1/resolve" {
+		if r.URL.Path != "/v2/resolve" {
 			http.NotFound(w, r)
 
 			return
@@ -79,14 +81,14 @@ func TestPackageCacheResolveCyclesEndpoints(t *testing.T) {
 			t.Fatalf("uids=%v", uids)
 		}
 
-		_ = json.NewEncoder(w).Encode([]string{"cached"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"cached": ""})
 	}))
 	defer good.Close()
 
 	var sleeps []time.Duration
 	cache := &packageCache{
 		endpoints: []string{failed.URL, good.URL},
-		available: map[string]bool{},
+		available: map[string]string{},
 		http:      &http.Client{},
 		sleep: func(delay time.Duration) {
 			sleeps = append(sleeps, delay)
@@ -123,7 +125,7 @@ func TestIsLoopbackEndpoint(t *testing.T) {
 
 func TestPackageCacheTriesLoopbackFirst(t *testing.T) {
 	local := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode([]string{"cached"})
+		_ = json.NewEncoder(w).Encode(map[string]string{"cached": ""})
 	}))
 	defer local.Close()
 
@@ -179,7 +181,7 @@ func TestPackageCacheResolveDropDoesNotAffectBlobFetch(t *testing.T) {
 	var blobCalls atomic.Int32
 	rejected := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/resolve":
+		case "/v2/resolve":
 			http.Error(w, "bad request", http.StatusBadRequest)
 		case "/v1/blob/cached":
 			blobCalls.Add(1)
@@ -192,8 +194,8 @@ func TestPackageCacheResolveDropDoesNotAffectBlobFetch(t *testing.T) {
 
 	resolver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/resolve":
-			_ = json.NewEncoder(w).Encode([]string{"cached"})
+		case "/v2/resolve":
+			_ = json.NewEncoder(w).Encode(map[string]string{"cached": ""})
 		default:
 			http.NotFound(w, r)
 		}
@@ -216,6 +218,46 @@ func TestPackageCacheResolveDropDoesNotAffectBlobFetch(t *testing.T) {
 
 	if blobCalls.Load() != 1 {
 		t.Fatalf("blob calls=%d", blobCalls.Load())
+	}
+}
+
+func TestPackageCacheRestoreRejectsBlobWithWrongHash(t *testing.T) {
+	blob := cacheArchive(t, map[string]string{"value": "good"})
+	forged := cacheArchive(t, map[string]string{"value": "evil"})
+
+	var forgedCalls, goodCalls atomic.Int32
+	mitm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forgedCalls.Add(1)
+		_, _ = w.Write(forged)
+	}))
+	defer mitm.Close()
+
+	honest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		goodCalls.Add(1)
+		_, _ = w.Write(blob)
+	}))
+	defer honest.Close()
+
+	sum := md5.Sum(blob)
+	cache := &packageCache{
+		endpoints: []string{mitm.URL, honest.URL},
+		available: map[string]string{"cached": hex.EncodeToString(sum[:])},
+		http:      &http.Client{},
+		sleep:     func(time.Duration) {},
+	}
+
+	root := t.TempDir()
+	out := filepath.Join(root, "out")
+	cache.restore("cached", out, filepath.Join(root, "trash"))
+
+	if forgedCalls.Load() != 1 || goodCalls.Load() != 1 {
+		t.Fatalf("calls forged=%d good=%d", forgedCalls.Load(), goodCalls.Load())
+	}
+
+	data, err := os.ReadFile(filepath.Join(out, "value"))
+
+	if err != nil || string(data) != "good" {
+		t.Fatalf("restored value=%q err=%v", data, err)
 	}
 }
 
@@ -411,8 +453,8 @@ func TestCachedNodeSkipsDependencyTraversal(t *testing.T) {
 	blob := cacheArchive(t, map[string]string{"value": "ready"})
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/v1/resolve":
-			_ = json.NewEncoder(w).Encode([]string{"target-uid"})
+		case "/v2/resolve":
+			_ = json.NewEncoder(w).Encode(map[string]string{"target-uid": ""})
 		case "/v1/blob/target-uid":
 			_, _ = w.Write(blob)
 		default:

@@ -4,6 +4,8 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,7 +24,7 @@ import (
 
 type packageCache struct {
 	endpoints []string
-	available map[string]bool
+	available map[string]string
 	http      *http.Client
 	sleep     func(time.Duration)
 }
@@ -81,7 +83,7 @@ func isLoopbackEndpoint(endpoint string) bool {
 func newPackageCache(raw string, nodes []Node) *packageCache {
 	cache := &packageCache{
 		endpoints: parseCacheEndpoints(raw),
-		available: map[string]bool{},
+		available: map[string]string{},
 		http:      &http.Client{},
 		sleep:     time.Sleep,
 	}
@@ -121,12 +123,18 @@ func newPackageCache(raw string, nodes []Node) *packageCache {
 }
 
 func (c *packageCache) has(uid string) bool {
-	return c != nil && uid != "" && c.available[uid]
+	if c == nil || uid == "" {
+		return false
+	}
+
+	_, ok := c.available[uid]
+
+	return ok
 }
 
 type cacheResolveResult struct {
 	endpoint  string
-	available []string
+	available map[string]string
 	err       error
 	infra     bool
 }
@@ -137,7 +145,7 @@ func cacheInfraStatus(code int) bool {
 
 func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload []byte) cacheResolveResult {
 	result := cacheResolveResult{endpoint: endpoint}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/v1/resolve", bytes.NewReader(payload))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint+"/v2/resolve", bytes.NewReader(payload))
 
 	if err != nil {
 		result.err = err
@@ -187,7 +195,7 @@ func (c *packageCache) resolveFrom(ctx context.Context, endpoint string, payload
 	return result
 }
 
-func (c *packageCache) resolve(uids []string) map[string]bool {
+func (c *packageCache) resolve(uids []string) map[string]string {
 	payload := Throw2(json.Marshal(uids))
 	timeouts := &retryTimeouts{current: 10 * time.Second}
 	good := append([]string{}, c.endpoints...)
@@ -227,21 +235,15 @@ func (c *packageCache) resolve(uids []string) map[string]bool {
 			continue
 		}
 
-		result := make(map[string]bool, len(resolved.available))
-
-		for _, uid := range resolved.available {
-			result[uid] = true
-		}
-
 		fmt.Fprintf(os.Stderr, "package cache: resolved %d/%d nodes via %s\n",
-			len(result), len(uids), resolved.endpoint)
+			len(resolved.available), len(uids), resolved.endpoint)
 
-		return result
+		return resolved.available
 	}
 
 	fmt.Fprintln(os.Stderr, "package cache: no usable resolve endpoints, continuing without cache")
 
-	return map[string]bool{}
+	return map[string]string{}
 }
 
 func removeEndpoint(items []string, index int) []string {
@@ -261,6 +263,7 @@ func (r *countingReader) Read(p []byte) (int, error) {
 }
 
 func (c *packageCache) restore(uid, outDir, trashDir string) {
+	expected := c.available[uid]
 	good := append([]string{}, c.endpoints...)
 	timeouts := &retryTimeouts{}
 	index := 0
@@ -312,7 +315,8 @@ func (c *packageCache) restore(uid, outDir, trashDir string) {
 			continue
 		}
 
-		body := &countingReader{Reader: resp.Body}
+		digest := md5.New()
+		body := &countingReader{Reader: io.TeeReader(resp.Body, digest)}
 		extractErr := Try(func() {
 			extractArchive(body, outDir)
 		})
@@ -323,6 +327,15 @@ func (c *packageCache) restore(uid, outDir, trashDir string) {
 			prepareDir(trashDir, outDir)
 			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: bad archive (%d/%d): %v %v, cycling endpoints\n",
 				uid, endpoint, body.n, resp.ContentLength, extractErr, bodyErr)
+			index++
+
+			continue
+		}
+
+		if got := hex.EncodeToString(digest.Sum(nil)); expected != "" && got != expected {
+			prepareDir(trashDir, outDir)
+			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: md5 %s, want %s, cycling endpoints\n",
+				uid, endpoint, got, expected)
 			index++
 
 			continue
