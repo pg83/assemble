@@ -431,6 +431,15 @@ func anyFailed(results []bool) bool {
 }
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "fetch" {
+		Try(func() {
+			cliFetch(os.Args[2:])
+		}).Catch(func(exc *Exception) {
+			fatal(exc, 1, "assemble fetch")
+		})
+		return
+	}
+
 	if len(os.Args) > 1 && os.Args[1] == "exec" {
 		Try(func() {
 			cliExec()
