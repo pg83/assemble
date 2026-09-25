@@ -333,12 +333,13 @@ func (c *packageCache) restore(uid, outDir, trashDir string) {
 		}
 
 		if got := hex.EncodeToString(digest.Sum(nil)); expected != "" && got != expected {
-			prepareDir(trashDir, outDir)
-			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: md5 %s, want %s, cycling endpoints\n",
+			// The index promised one blob and the store served another: the
+			// uid was rebuilt after this run resolved it. No endpoint can
+			// serve the hash we hold, so retrying only spins; die on the
+			// spot and let the caller start over with a fresh resolve.
+			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: md5 %s, want %s, exiting\n",
 				uid, endpoint, got, expected)
-			index++
-
-			continue
+			os.Exit(3)
 		}
 
 		return
