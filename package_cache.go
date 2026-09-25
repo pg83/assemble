@@ -262,6 +262,9 @@ func (r *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// exit ends the process; tests swap it for something that reports.
+var exit = os.Exit
+
 func (c *packageCache) restore(uid, outDir, trashDir string) {
 	expected := c.available[uid]
 	good := append([]string{}, c.endpoints...)
@@ -339,7 +342,7 @@ func (c *packageCache) restore(uid, outDir, trashDir string) {
 			// spot and let the caller start over with a fresh resolve.
 			fmt.Fprintf(os.Stderr, "package cache fetch %s from %s: md5 %s, want %s, exiting\n",
 				uid, endpoint, got, expected)
-			os.Exit(3)
+			exit(3)
 		}
 
 		return

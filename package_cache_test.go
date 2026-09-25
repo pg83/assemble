@@ -221,7 +221,7 @@ func TestPackageCacheResolveDropDoesNotAffectBlobFetch(t *testing.T) {
 	}
 }
 
-func TestPackageCacheRestoreRejectsBlobWithWrongHash(t *testing.T) {
+func TestPackageCacheRestoreDiesOnBlobWithWrongHash(t *testing.T) {
 	blob := cacheArchive(t, map[string]string{"value": "good"})
 	forged := cacheArchive(t, map[string]string{"value": "evil"})
 
@@ -246,18 +246,35 @@ func TestPackageCacheRestoreRejectsBlobWithWrongHash(t *testing.T) {
 		sleep:     func(time.Duration) {},
 	}
 
+	// A mismatch means the uid was rebuilt behind our back; the only
+	// sane move is to die so the caller resolves again, never to shop
+	// the stale hash around other endpoints.
+	type died struct{ code int }
+	saved := exit
+	exit = func(code int) { panic(died{code}) }
+	defer func() { exit = saved }()
+
 	root := t.TempDir()
 	out := filepath.Join(root, "out")
-	cache.restore("cached", out, filepath.Join(root, "trash"))
 
-	if forgedCalls.Load() != 1 || goodCalls.Load() != 1 {
-		t.Fatalf("calls forged=%d good=%d", forgedCalls.Load(), goodCalls.Load())
+	code := func() (code int) {
+		defer func() {
+			if d, ok := recover().(died); ok {
+				code = d.code
+			}
+		}()
+
+		cache.restore("cached", out, filepath.Join(root, "trash"))
+
+		return -1
+	}()
+
+	if code != 3 {
+		t.Fatalf("exit code=%d", code)
 	}
 
-	data, err := os.ReadFile(filepath.Join(out, "value"))
-
-	if err != nil || string(data) != "good" {
-		t.Fatalf("restored value=%q err=%v", data, err)
+	if forgedCalls.Load() != 1 || goodCalls.Load() != 0 {
+		t.Fatalf("calls forged=%d good=%d", forgedCalls.Load(), goodCalls.Load())
 	}
 }
 
